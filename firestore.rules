@@ -1,0 +1,20 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── licenseKeys ──────────────────────────────────────────────────────────
+    // Keys are created and modified ONLY by Cloud Functions (admin SDK).
+    // The Android app has NO direct read/write access — all validation goes
+    // through the validateLicenseKey Cloud Function.
+    match /licenseKeys/{keyId} {
+      // No client reads or writes allowed.
+      allow read, write: if false;
+    }
+
+    // ── Everything else: deny by default ─────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

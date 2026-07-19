@@ -1,0 +1,33 @@
+> I have an existing Android app called **Zoneygram** (package name `itszoney`, e.g. `com.itszoney.zoneygram`) already built in Kotlin. I need you to **audit and upgrade** the existing codebase to add license-key authentication and anti-tampering protection — without breaking existing functionality.
+>
+> **Step 1 — Audit first:**
+> - Review my existing login/auth flow, Firebase setup (or lack of it), Gradle config, and ProGuard/R8 settings
+> - Report back what's already in place vs. what's missing before making changes
+> - Identify any existing logic that does security-sensitive checks (login, premium features, etc.) so we don't duplicate or conflict with it
+>
+> **Step 2 — Add license-key system (only if not already present):**
+> - Firestore collection `licenseKeys`: `key`, `durationDays`, `createdAt`, `activatedAt`, `expiresAt`, `isUsed`, `deviceId`, `isRevoked`
+> - Add a Cloud Function for server-side validation; wire it into the existing login screen rather than replacing the whole auth flow if Firebase Auth is already integrated
+> - Preserve existing user data/sessions — this should be additive, not a rewrite
+>
+> **Step 3 — Retrofit anti-tampering into the existing build:**
+> - Enable/upgrade R8 full mode in the existing `build.gradle` (check current `minifyEnabled`/`proguard-rules.pro` and strengthen rather than duplicate)
+> - Identify the existing license/validation decision point in Kotlin and migrate *only that specific check* into a new native C++/JNI module — don't rewrite unrelated app logic
+> - Add runtime signing-certificate verification as a new native check, called early in `Application.onCreate()` or main activity
+>
+> **Step 4 — Add detection layers without disrupting existing UX:**
+> - Add Frida/root/emulator detection as new, isolated modules
+> - Wire failures into the *existing* error-handling/UI patterns already in the app (don't introduce new crash points or new UI patterns inconsistent with the rest of the app)
+> - Integrate Play Integrity API results into the existing license check, not as a separate blocking gate
+>
+> **Step 5 — Compliance check on the existing app:**
+> - Review existing `AndroidManifest.xml` permissions — flag anything unused or unjustified for removal
+> - Check current `targetSdkVersion` against the latest Play Console requirement and update if outdated
+> - Confirm existing Privacy Policy/Data Safety form (if any) covers new device-ID and license data collection; flag what needs updating
+>
+> **Constraints:**
+> - Do not remove or break any existing working features
+> - Show me a diff/summary of every file changed and why
+> - Flag anything where retrofitting would require a significant architecture change, so I can decide before you proceed
+> - Keep all changes limited to this app's own sandbox — no interaction with other apps or system-wide settings
+> - Full Play Store compliance: no restricted permissions, accurate Data Safety disclosure, standard `targetSdkVersion`

@@ -1,0 +1,239 @@
+name: Build & Release
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Triggers
+# ──────────────────────────────────────────────────────────────────────────────
+# • Every push to main / master  → build, upload APKs as artifacts
+# • Tag push matching v*         → build + create a GitHub Release
+# • Manual trigger (workflow_dispatch) with optional release toggle
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [ main, master ]
+    tags:     [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create a GitHub Release?'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+
+# Cancel any in-progress run for the same ref so pushes don't queue up.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Java version required by the Android Gradle plugin
+  JAVA_VERSION: '17'
+  # Gradle flags to speed up CI builds
+  GRADLE_OPTS: >-
+    -Dorg.gradle.jvmargs=-Xmx4g
+    -Dorg.gradle.caching=true
+    -Dorg.gradle.daemon=false
+    -Dkotlin.incremental=false
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build Release APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      # ── 1. Source ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0      # full history – needed for version calculations
+
+      # ── 2. Java ────────────────────────────────────────────────────────────
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: gradle
+
+      # ── 3. Android SDK ─────────────────────────────────────────────────────
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # ── 4. NDK (version is read from version.properties at build time) ─────
+      - name: Read required NDK version
+        id: ndk_ver
+        run: |
+          # version.properties has both version.ndk_primary and version.ndk_legacy;
+          # the build uses ndk_legacy as the default NDK path (see ModulePlugin.kt).
+          NDK=$(grep '^version.ndk_legacy=' version.properties | cut -d= -f2 | tr -d '[:space:]')
+          echo "ndk_version=$NDK" >> "$GITHUB_OUTPUT"
+
+      - name: Install NDK ${{ steps.ndk_ver.outputs.ndk_version }}
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;${{ steps.ndk_ver.outputs.ndk_version }}"
+
+      # ── 5. Gradle cache ────────────────────────────────────────────────────
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # ── 6. Native dependency cache (ffmpeg, vpx, webrtc – very large) ──────
+      - name: Cache native build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/jni/.cxx
+            app/build/intermediates/cmake
+          key: native-${{ runner.os }}-${{ hashFiles('app/jni/**', 'version.properties') }}
+          restore-keys: native-${{ runner.os }}-
+
+      # ── 7. Decode keystore from secret ────────────────────────────────────
+      - name: Decode signing keystore
+        if: ${{ env.SIGNING_KEYSTORE_BASE64 != '' }}
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+        run: |
+          echo "$SIGNING_KEYSTORE_BASE64" | base64 --decode > keystore.jks
+          echo "KEYSTORE_PATH=$(pwd)/keystore.jks" >> "$GITHUB_ENV"
+
+      # ── 8. Write local.properties ─────────────────────────────────────────
+      #
+      # Required keys (add all of these as GitHub repository / environment secrets):
+      #   TELEGRAM_API_ID           – numeric Telegram API id
+      #   TELEGRAM_API_HASH         – Telegram API hash string
+      #   APP_ID                    – Android application id  (e.g. org.thunderdog.challegram)
+      #   APP_NAME                  – Display name            (e.g. Telegram X)
+      #   APP_DOWNLOAD_URL          – Public download URL
+      #   SIGNING_KEYSTORE_BASE64   – Base64-encoded JKS / PKCS12 keystore
+      #   SIGNING_STORE_PASSWORD    – Keystore password
+      #   SIGNING_KEY_ALIAS         – Key alias inside the keystore
+      #   SIGNING_KEY_PASSWORD      – Key password
+      #
+      # Optional:
+      #   NTGCALLS_ENABLED          – "true" to download & bundle NTgCalls AAR
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Write local.properties
+        env:
+          TELEGRAM_API_ID:        ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH:      ${{ secrets.TELEGRAM_API_HASH }}
+          APP_ID:                 ${{ secrets.APP_ID }}
+          APP_NAME:               ${{ secrets.APP_NAME }}
+          APP_DOWNLOAD_URL:       ${{ secrets.APP_DOWNLOAD_URL }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS:      ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD:   ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          cat > local.properties <<EOF
+          sdk.dir=$ANDROID_HOME
+          telegram.api_id=${TELEGRAM_API_ID:-0}
+          telegram.api_hash=${TELEGRAM_API_HASH:-}
+          app.id=${APP_ID:-com.itszoney}
+          app.name=${APP_NAME:-Zoneygram}
+          app.download_url=${APP_DOWNLOAD_URL:-https://telegram.org/dlx}
+          EOF
+
+          # Keystore signing (skipped if no keystore secret is set)
+          if [ -n "$KEYSTORE_PATH" ]; then
+            cat >> local.properties <<EOF
+          keystore.file=$KEYSTORE_PATH
+          keystore.store_password=${SIGNING_STORE_PASSWORD}
+          keystore.key_alias=${SIGNING_KEY_ALIAS}
+          keystore.key_password=${SIGNING_KEY_PASSWORD}
+          EOF
+          else
+            echo "app.disable_signing=true" >> local.properties
+          fi
+
+      # ── 9. (Optional) Download NTgCalls AAR ───────────────────────────────
+      - name: Download NTgCalls AAR
+        if: ${{ vars.NTGCALLS_ENABLED == 'true' || secrets.NTGCALLS_ENABLED == 'true' }}
+        run: |
+          mkdir -p app/libs
+          NTGCALLS_TAG=$(curl -sL \
+            "https://api.github.com/repos/pytgcalls/ntgcalls/releases/latest" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")
+
+          ASSET_URL=$(curl -sL \
+            "https://api.github.com/repos/pytgcalls/ntgcalls/releases/latest" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for a in data['assets']:
+            if 'android' in a['name'] and a['name'].endswith('.aar'):
+              print(a['browser_download_url'])
+              break
+          ")
+          if [ -n "$ASSET_URL" ]; then
+            curl -sL "$ASSET_URL" -o app/libs/ntgcalls.aar
+            echo "NTgCalls AAR downloaded: $ASSET_URL"
+          else
+            echo "No Android AAR found in NTgCalls release $NTGCALLS_TAG – skipping"
+          fi
+
+      # ── 10. Build ─────────────────────────────────────────────────────────
+      - name: Build release APK (all ABIs)
+        run: ./gradlew assembleRelease --stacktrace
+
+      # ── 11. Collect APKs ──────────────────────────────────────────────────
+      - name: Collect APKs
+        id: collect_apks
+        run: |
+          mkdir -p dist
+          find app/build/outputs/apk/*/release/ -name "*.apk" -exec cp {} dist/ \;
+          ls -lh dist/
+          echo "apk_count=$(ls dist/*.apk | wc -l)" >> "$GITHUB_OUTPUT"
+
+      # ── 12. Upload APKs as workflow artifacts ─────────────────────────────
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apks-${{ github.sha }}
+          path: dist/*.apk
+          retention-days: 30
+
+      # ── 13. GitHub Release (on tag push or manual trigger) ────────────────
+      - name: Create GitHub Release
+        if: >
+          startsWith(github.ref, 'refs/tags/v') ||
+          github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   ${{ github.ref_name }}
+          name:       Release ${{ github.ref_name }}
+          draft:      false
+          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          body: |
+            ## Zoneygram – ${{ github.ref_name }}
+
+            ### What changed
+            <!-- Edit this section before publishing or use release-drafter -->
+            See the [full commit history](${{ github.server_url }}/${{ github.repository }}/commits/${{ github.sha }})
+            for all changes in this release.
+
+            ### Volume improvements
+            - Separate **Volume Boost** slider (100 %–500 %) in sound settings.
+            - Boost works in 1-on-1 calls, group calls and channel calls.
+            - Signal Gain, Bass, and Treble controls preserved.
+
+            ### Downloads
+            Install the APK that matches your device ABI:
+            | ABI | File |
+            |-----|------|
+            | arm64-v8a  (most modern phones) | `*-arm64-v8a*.apk`  |
+            | armeabi-v7a (older/32-bit)      | `*-armeabi-v7a*.apk`|
+            | x86_64 (emulators)              | `*-x86_64*.apk`     |
+          files: dist/*.apk
+          token: ${{ secrets.GITHUB_TOKEN }}

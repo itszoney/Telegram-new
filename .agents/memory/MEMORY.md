@@ -1,0 +1,1 @@
+- [Security layer architecture](security-layer.md) — license gate + anti-tamper added to Telegram X; cert hash placeholder must be filled before release.
