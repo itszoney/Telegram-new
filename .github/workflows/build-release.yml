@@ -120,8 +120,6 @@ jobs:
       #   SIGNING_KEY_ALIAS         – Key alias inside the keystore
       #   SIGNING_KEY_PASSWORD      – Key password
       #
-      # Optional:
-      #   NTGCALLS_ENABLED          – "true" to download & bundle NTgCalls AAR
       # ─────────────────────────────────────────────────────────────────────
       - name: Write local.properties
         env:
@@ -155,9 +153,8 @@ jobs:
             echo "app.disable_signing=true" >> local.properties
           fi
 
-      # ── 9. (Optional) Download NTgCalls AAR ───────────────────────────────
+      # ── 9. Download NTgCalls AAR (always enabled) ─────────────────────────
       - name: Download NTgCalls AAR
-        if: ${{ vars.NTGCALLS_ENABLED == 'true' || secrets.NTGCALLS_ENABLED == 'true' }}
         run: |
           mkdir -p app/libs
           NTGCALLS_TAG=$(curl -sL \
