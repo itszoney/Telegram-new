@@ -43,7 +43,7 @@ jobs:
           fetch-depth: 0
 
       # ------------------------------------------------------------
-      # CACHE – using a new key to avoid old broken caches
+      # CACHE – fresh key to avoid old broken caches
       # ------------------------------------------------------------
       - name: Cache submodules
         uses: actions/cache@v5.1.0
@@ -54,9 +54,9 @@ jobs:
             app/jni/third_party
             thirdparty/androidx-media
             vkryl
-          key: submodules-v5-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
+          key: submodules-v6-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
           restore-keys: |
-            submodules-v5-${{ runner.os }}-
+            submodules-v6-${{ runner.os }}-
 
       # ------------------------------------------------------------
       # FORCE-CLEAN and INIT submodules
@@ -84,63 +84,104 @@ jobs:
           else
             echo "ERROR: opensslv.h still missing"
             echo "submodule_ok=false" >> "$GITHUB_OUTPUT"
-            # We'll try manual fallback in the next step
           fi
 
       # ------------------------------------------------------------
-      # MANUAL FALLBACK – clone OpenSSL if submodule failed
+      # MANUAL FALLBACK – clone tdlib and OpenSSL if submodule failed
       # ------------------------------------------------------------
-      - name: Manual OpenSSL clone (fallback)
+      - name: Manual clone of tdlib and OpenSSL (fallback)
         if: steps.submodule_init.outputs.submodule_ok == 'false'
         run: |
-          echo "Attempting manual clone of OpenSSL into tdlib/source/openssl"
+          echo "Starting manual fallback for tdlib and OpenSSL"
 
-          # Ensure tdlib directory exists
+          # -----------------------------------------------------------------
+          # 1. Clone tdlib manually if missing
+          # -----------------------------------------------------------------
           if [ ! -d "tdlib" ]; then
-            echo "tdlib directory missing – cannot proceed with manual clone"
-            exit 1
+            echo "tdlib directory missing – cloning manually"
+
+            # Get the submodule URL from .gitmodules
+            TDLIB_URL=$(git config --file .gitmodules submodule.tdlib.url)
+            if [ -z "$TDLIB_URL" ]; then
+              echo "ERROR: Could not find submodule.tdlib.url in .gitmodules"
+              exit 1
+            fi
+
+            # Get the pinned commit hash from the parent repo's index
+            TDLIB_COMMIT=$(git ls-tree HEAD tdlib | awk '{print $3}')
+            if [ -z "$TDLIB_COMMIT" ]; then
+              echo "ERROR: Could not get commit hash for tdlib from git ls-tree"
+              exit 1
+            fi
+
+            echo "Cloning tdlib from $TDLIB_URL at commit $TDLIB_COMMIT"
+            git clone --depth 1 --branch "$TDLIB_COMMIT" "$TDLIB_URL" tdlib || {
+              echo "Clone with branch failed, trying full clone and checkout..."
+              git clone "$TDLIB_URL" tdlib
+              (cd tdlib && git checkout "$TDLIB_COMMIT")
+            }
+
+            # Ensure we have the .git directory (if not, submodule commands won't work)
+            if [ ! -d "tdlib/.git" ]; then
+              echo "ERROR: tdlib clone failed or .git missing"
+              exit 1
+            fi
+            echo "tdlib cloned successfully"
           fi
 
-          # Try to get the correct OpenSSL commit from tdlib/.gitmodules
-          OPENSSL_COMMIT=""
-          if [ -f "tdlib/.gitmodules" ]; then
-            echo "tdlib/.gitmodules found. Parsing for openssl submodule..."
-            # Extract the commit hash from the submodule status (if available)
-            (cd tdlib && git submodule status) | while read line; do
-              if [[ "$line" == *"source/openssl"* ]]; then
-                commit=$(echo "$line" | awk '{print $1}' | sed 's/^[+-]//')
-                OPENSSL_COMMIT="$commit"
-                echo "Found OpenSSL commit: $OPENSSL_COMMIT"
-                break
-              fi
-            done
-          fi
+          # -----------------------------------------------------------------
+          # 2. Clone OpenSSL inside tdlib/source/openssl if missing
+          # -----------------------------------------------------------------
+          if [ ! -f "tdlib/source/openssl/include/openssl/opensslv.h" ]; then
+            echo "OpenSSL header missing – cloning OpenSSL manually"
 
-          # If no commit found, use a known stable tag
-          if [ -z "$OPENSSL_COMMIT" ]; then
-            echo "Could not determine OpenSSL commit, falling back to OpenSSL 3.0.15"
-            OPENSSL_COMMIT="openssl-3.0.15"
-          fi
+            # Ensure the source directory exists
+            mkdir -p tdlib/source
 
-          # Remove any existing directory and clone fresh
-          rm -rf tdlib/source/openssl
-          mkdir -p tdlib/source
+            # Try to get OpenSSL commit from tdlib/.gitmodules if present
+            OPENSSL_COMMIT=""
+            if [ -f "tdlib/.gitmodules" ]; then
+              # Parse submodule entry for source/openssl
+              OPENSSL_URL=$(cd tdlib && git config --file .gitmodules submodule.source/openssl.url)
+              OPENSSL_COMMIT=$(cd tdlib && git ls-tree HEAD source/openssl | awk '{print $3}')
+              echo "Found OpenSSL URL: $OPENSSL_URL, commit: $OPENSSL_COMMIT"
+            fi
 
-          echo "Cloning OpenSSL (commit $OPENSSL_COMMIT) into tdlib/source/openssl"
-          git clone --depth 1 --branch "$OPENSSL_COMMIT" https://github.com/openssl/openssl.git tdlib/source/openssl || {
-            echo "Clone with branch/tag failed, trying with specific commit hash..."
-            git clone https://github.com/openssl/openssl.git tdlib/source/openssl
-            (cd tdlib/source/openssl && git checkout "$OPENSSL_COMMIT")
-          }
+            # If still missing, fallback to a known tag
+            if [ -z "$OPENSSL_COMMIT" ]; then
+              echo "Could not determine OpenSSL commit, falling back to openssl-3.0.15"
+              OPENSSL_COMMIT="openssl-3.0.15"
+              OPENSSL_URL="https://github.com/openssl/openssl.git"
+            fi
 
-          # Verify again
-          echo "--- Verifying openssl header after manual clone ---"
-          if [ -f "tdlib/source/openssl/include/openssl/opensslv.h" ]; then
-            echo "SUCCESS: opensslv.h now found"
+            # Remove any existing directory and clone fresh
+            rm -rf tdlib/source/openssl
+
+            echo "Cloning OpenSSL from $OPENSSL_URL at $OPENSSL_COMMIT"
+            git clone --depth 1 --branch "$OPENSSL_COMMIT" "$OPENSSL_URL" tdlib/source/openssl || {
+              echo "Branch clone failed, trying full clone and checkout..."
+              git clone "$OPENSSL_URL" tdlib/source/openssl
+              (cd tdlib/source/openssl && git checkout "$OPENSSL_COMMIT")
+            }
+
+            # Verify
+            if [ ! -f "tdlib/source/openssl/include/openssl/opensslv.h" ]; then
+              echo "ERROR: OpenSSL clone still did not produce the header"
+              echo "Contents of tdlib/source/openssl:"
+              ls -la tdlib/source/openssl/
+              exit 1
+            fi
+            echo "OpenSSL cloned successfully"
           else
-            echo "ERROR: Manual clone still did not produce the header"
-            echo "Contents of tdlib/source/openssl:"
-            ls -la tdlib/source/openssl/
+            echo "OpenSSL header already present"
+          fi
+
+          # Final verification
+          echo "--- Final verification ---"
+          if [ -f "tdlib/source/openssl/include/openssl/opensslv.h" ]; then
+            echo "SUCCESS: opensslv.h is present"
+          else
+            echo "FATAL: opensslv.h still missing after fallback"
             exit 1
           fi
 
