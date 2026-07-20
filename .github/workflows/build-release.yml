@@ -54,9 +54,9 @@ jobs:
             app/jni/third_party
             thirdparty/androidx-media
             vkryl
-          key: submodules-v6-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
+          key: submodules-v7-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
           restore-keys: |
-            submodules-v6-${{ runner.os }}-
+            submodules-v7-${{ runner.os }}-
 
       # ------------------------------------------------------------
       # FORCE-CLEAN and INIT submodules
@@ -95,42 +95,48 @@ jobs:
           echo "Starting manual fallback for tdlib and OpenSSL"
 
           # -----------------------------------------------------------------
-          # 1. Clone tdlib manually if missing
+          # 1. Get tdlib URL and commit hash from the parent repo
+          # -----------------------------------------------------------------
+          # URL from .gitmodules
+          TDLIB_URL=$(git config --file .gitmodules submodule.tdlib.url)
+          if [ -z "$TDLIB_URL" ]; then
+            echo "ERROR: Could not find submodule.tdlib.url in .gitmodules"
+            exit 1
+          fi
+
+          # Commit hash from git submodule status (even if not checked out)
+          # This outputs lines like: " 1234567890abcdef tdlib (heads/master)"
+          TDLIB_COMMIT=$(git submodule status | grep ' tdlib ' | awk '{print $1}' | sed 's/^[+-]//')
+          if [ -z "$TDLIB_COMMIT" ]; then
+            # Fallback to ls-tree if submodule status fails
+            TDLIB_COMMIT=$(git ls-tree HEAD tdlib | awk '{print $3}')
+          fi
+          if [ -z "$TDLIB_COMMIT" ]; then
+            echo "ERROR: Could not get commit hash for tdlib from git submodule status or git ls-tree"
+            exit 1
+          fi
+          echo "TDLIB_URL=$TDLIB_URL, TDLIB_COMMIT=$TDLIB_COMMIT"
+
+          # -----------------------------------------------------------------
+          # 2. Clone tdlib manually if missing
           # -----------------------------------------------------------------
           if [ ! -d "tdlib" ]; then
             echo "tdlib directory missing – cloning manually"
-
-            # Get the submodule URL from .gitmodules
-            TDLIB_URL=$(git config --file .gitmodules submodule.tdlib.url)
-            if [ -z "$TDLIB_URL" ]; then
-              echo "ERROR: Could not find submodule.tdlib.url in .gitmodules"
-              exit 1
-            fi
-
-            # Get the pinned commit hash from the parent repo's index
-            TDLIB_COMMIT=$(git ls-tree HEAD tdlib | awk '{print $3}')
-            if [ -z "$TDLIB_COMMIT" ]; then
-              echo "ERROR: Could not get commit hash for tdlib from git ls-tree"
-              exit 1
-            fi
-
-            echo "Cloning tdlib from $TDLIB_URL at commit $TDLIB_COMMIT"
-            git clone --depth 1 --branch "$TDLIB_COMMIT" "$TDLIB_URL" tdlib || {
-              echo "Clone with branch failed, trying full clone and checkout..."
-              git clone "$TDLIB_URL" tdlib
-              (cd tdlib && git checkout "$TDLIB_COMMIT")
-            }
-
-            # Ensure we have the .git directory (if not, submodule commands won't work)
+            # Try shallow clone with the commit (if it's a branch/tag, use --branch)
+            # For a commit SHA, we can't use --branch, so do full clone and checkout
+            git clone "$TDLIB_URL" tdlib
+            (cd tdlib && git checkout "$TDLIB_COMMIT")
             if [ ! -d "tdlib/.git" ]; then
               echo "ERROR: tdlib clone failed or .git missing"
               exit 1
             fi
             echo "tdlib cloned successfully"
+          else
+            echo "tdlib already exists"
           fi
 
           # -----------------------------------------------------------------
-          # 2. Clone OpenSSL inside tdlib/source/openssl if missing
+          # 3. Clone OpenSSL inside tdlib/source/openssl if missing
           # -----------------------------------------------------------------
           if [ ! -f "tdlib/source/openssl/include/openssl/opensslv.h" ]; then
             echo "OpenSSL header missing – cloning OpenSSL manually"
@@ -138,12 +144,16 @@ jobs:
             # Ensure the source directory exists
             mkdir -p tdlib/source
 
-            # Try to get OpenSSL commit from tdlib/.gitmodules if present
+            # Try to get OpenSSL commit from tdlib/.gitmodules
+            OPENSSL_URL=""
             OPENSSL_COMMIT=""
             if [ -f "tdlib/.gitmodules" ]; then
-              # Parse submodule entry for source/openssl
+              # Get URL and commit from submodule status inside tdlib
               OPENSSL_URL=$(cd tdlib && git config --file .gitmodules submodule.source/openssl.url)
-              OPENSSL_COMMIT=$(cd tdlib && git ls-tree HEAD source/openssl | awk '{print $3}')
+              OPENSSL_COMMIT=$(cd tdlib && git submodule status | grep ' source/openssl ' | awk '{print $1}' | sed 's/^[+-]//')
+              if [ -z "$OPENSSL_COMMIT" ]; then
+                OPENSSL_COMMIT=$(cd tdlib && git ls-tree HEAD source/openssl | awk '{print $3}')
+              fi
               echo "Found OpenSSL URL: $OPENSSL_URL, commit: $OPENSSL_COMMIT"
             fi
 
@@ -158,11 +168,14 @@ jobs:
             rm -rf tdlib/source/openssl
 
             echo "Cloning OpenSSL from $OPENSSL_URL at $OPENSSL_COMMIT"
-            git clone --depth 1 --branch "$OPENSSL_COMMIT" "$OPENSSL_URL" tdlib/source/openssl || {
+            # Try to clone with --branch (if it's a tag/branch) else full clone + checkout
+            if git clone --depth 1 --branch "$OPENSSL_COMMIT" "$OPENSSL_URL" tdlib/source/openssl 2>/dev/null; then
+              echo "Clone with branch/tag succeeded"
+            else
               echo "Branch clone failed, trying full clone and checkout..."
               git clone "$OPENSSL_URL" tdlib/source/openssl
               (cd tdlib/source/openssl && git checkout "$OPENSSL_COMMIT")
-            }
+            fi
 
             # Verify
             if [ ! -f "tdlib/source/openssl/include/openssl/opensslv.h" ]; then
