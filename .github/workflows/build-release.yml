@@ -42,7 +42,9 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # --- FIXED submodule cache with version bump to avoid broken shallow clones ---
+      # ----------------------------------------------
+      # CLEAR OLD CACHE – use a fresh cache key
+      # ----------------------------------------------
       - name: Cache submodules
         uses: actions/cache@v5.1.0
         with:
@@ -52,18 +54,36 @@ jobs:
             app/jni/third_party
             thirdparty/androidx-media
             vkryl
-          key: submodules-v2-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
+          key: submodules-v3-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
           restore-keys: |
-            submodules-v2-${{ runner.os }}-
+            submodules-v3-${{ runner.os }}-
 
-      # --- FIXED submodule initialisation: no --depth=1, ensures nested submodules are fully fetched ---
-      - name: Force-init all submodules (incl. nested)
+      # ----------------------------------------------
+      # ROBUST SUBMODULE INIT – deinit + full fetch
+      # ----------------------------------------------
+      - name: Force-clean and init all submodules
         run: |
+          # Remove any existing tdlib submodule state to force a fresh clone
+          git submodule deinit -f tdlib || true
           git submodule sync --recursive
-          # Convert any shallow submodules to full clones (prevents nested submodule failures)
+
+          # Ensure all submodules are full (non-shallow) clones
           git submodule foreach --recursive 'git fetch --unshallow || true'
-          # Initialize recursively without depth limit
+
+          # Now initialize everything recursively, without depth limit
           git submodule update --init --recursive --force
+
+          # Explicitly verify and init inside tdlib (defensive)
+          if [ -d "tdlib/.git" ]; then
+            echo "tdlib submodule is present, checking its submodules..."
+            (cd tdlib && git submodule sync && git submodule update --init --recursive --force)
+          else
+            echo "WARNING: tdlib directory is missing! Trying to fetch manually..."
+            git submodule update --init --force tdlib
+            (cd tdlib && git submodule sync && git submodule update --init --recursive --force)
+          fi
+
+          # Final verification
           echo "--- Verifying openssl header ---"
           if [ -f "tdlib/source/openssl/include/openssl/opensslv.h" ]; then
             echo "SUCCESS: opensslv.h found"
@@ -71,8 +91,10 @@ jobs:
             echo "ERROR: opensslv.h still missing"
             echo "--- tdlib/source/openssl contents ---"
             ls -la tdlib/source/openssl/ 2>/dev/null || echo "tdlib/source/openssl/ does not exist"
-            echo "--- git submodule status ---"
+            echo "--- git submodule status (recursive) ---"
             git submodule status --recursive
+            echo "--- tdlib/.gitmodules (if any) ---"
+            cat tdlib/.gitmodules 2>/dev/null || echo "tdlib/.gitmodules not found"
             exit 1
           fi
 
