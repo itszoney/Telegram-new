@@ -80,23 +80,31 @@ jobs:
           restore-keys: native-${{ runner.os }}-
 
       - name: Decode signing keystore
-        if: ${{ env.SIGNING_KEYSTORE_BASE64 != '' }}
+        if: ${{ secrets.SIGNING_KEYSTORE_BASE64 != '' }}
         env:
           SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD:  ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS:       ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD:    ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
           echo "$SIGNING_KEYSTORE_BASE64" | base64 --decode > keystore.jks
-          echo "KEYSTORE_PATH=$(pwd)/keystore.jks" >> "$GITHUB_ENV"
+
+          cat > keystore-config.properties <<EOF
+          keystore.file=$(pwd)/keystore.jks
+          keystore.password=${SIGNING_STORE_PASSWORD}
+          key.alias=${SIGNING_KEY_ALIAS}
+          key.password=${SIGNING_KEY_PASSWORD}
+          EOF
+
+          echo "KEYSTORE_CONFIG_PATH=$(pwd)/keystore-config.properties" >> "$GITHUB_ENV"
 
       - name: Write local.properties
         env:
-          TELEGRAM_API_ID:        ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH:      ${{ secrets.TELEGRAM_API_HASH }}
-          APP_ID:                 ${{ secrets.APP_ID }}
-          APP_NAME:               ${{ secrets.APP_NAME }}
-          APP_DOWNLOAD_URL:       ${{ secrets.APP_DOWNLOAD_URL }}
-          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_KEY_ALIAS:      ${{ secrets.SIGNING_KEY_ALIAS }}
-          SIGNING_KEY_PASSWORD:   ${{ secrets.SIGNING_KEY_PASSWORD }}
+          TELEGRAM_API_ID:   ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          APP_ID:            ${{ secrets.APP_ID }}
+          APP_NAME:          ${{ secrets.APP_NAME }}
+          APP_DOWNLOAD_URL:  ${{ secrets.APP_DOWNLOAD_URL }}
         run: |
           cat > local.properties <<EOF
           sdk.dir=$ANDROID_HOME
@@ -107,13 +115,8 @@ jobs:
           app.download_url=${APP_DOWNLOAD_URL:-https://telegram.org/dlx}
           EOF
 
-          if [ -n "$KEYSTORE_PATH" ]; then
-            cat >> local.properties <<EOF
-          keystore.file=$KEYSTORE_PATH
-          keystore.store_password=${SIGNING_STORE_PASSWORD}
-          keystore.key_alias=${SIGNING_KEY_ALIAS}
-          keystore.key_password=${SIGNING_KEY_PASSWORD}
-          EOF
+          if [ -n "$KEYSTORE_CONFIG_PATH" ]; then
+            echo "keystore.file=$KEYSTORE_CONFIG_PATH" >> local.properties
           else
             echo "app.disable_signing=true" >> local.properties
           fi
