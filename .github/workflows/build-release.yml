@@ -42,9 +42,9 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # ----------------------------------------------
-      # CLEAR OLD CACHE – use a fresh cache key
-      # ----------------------------------------------
+      # ------------------------------------------------------------
+      # CACHE – using a new key to avoid old broken caches
+      # ------------------------------------------------------------
       - name: Cache submodules
         uses: actions/cache@v5.1.0
         with:
@@ -54,50 +54,99 @@ jobs:
             app/jni/third_party
             thirdparty/androidx-media
             vkryl
-          key: submodules-v3-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
+          key: submodules-v5-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
           restore-keys: |
-            submodules-v3-${{ runner.os }}-
+            submodules-v5-${{ runner.os }}-
 
-      # ----------------------------------------------
-      # ROBUST SUBMODULE INIT – deinit + full fetch
-      # ----------------------------------------------
-      - name: Force-clean and init all submodules
+      # ------------------------------------------------------------
+      # FORCE-CLEAN and INIT submodules
+      # ------------------------------------------------------------
+      - name: Force-clean and init submodules
+        id: submodule_init
         run: |
-          # Remove any existing tdlib submodule state to force a fresh clone
-          git submodule deinit -f tdlib || true
+          # Remove any stale tdlib folder and its Git metadata
+          rm -rf tdlib .git/modules/tdlib
           git submodule sync --recursive
-
-          # Ensure all submodules are full (non-shallow) clones
-          git submodule foreach --recursive 'git fetch --unshallow || true'
-
-          # Now initialize everything recursively, without depth limit
           git submodule update --init --recursive --force
 
-          # Explicitly verify and init inside tdlib (defensive)
+          # Extra check inside tdlib (if it exists)
           if [ -d "tdlib/.git" ]; then
-            echo "tdlib submodule is present, checking its submodules..."
+            echo "tdlib submodule present, checking its submodules..."
             (cd tdlib && git submodule sync && git submodule update --init --recursive --force)
           else
-            echo "WARNING: tdlib directory is missing! Trying to fetch manually..."
-            git submodule update --init --force tdlib
-            (cd tdlib && git submodule sync && git submodule update --init --recursive --force)
+            echo "WARNING: tdlib directory still missing after submodule init!"
           fi
 
-          # Final verification
-          echo "--- Verifying openssl header ---"
+          # Verify OpenSSL header
           if [ -f "tdlib/source/openssl/include/openssl/opensslv.h" ]; then
             echo "SUCCESS: opensslv.h found"
+            echo "submodule_ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "ERROR: opensslv.h still missing"
-            echo "--- tdlib/source/openssl contents ---"
-            ls -la tdlib/source/openssl/ 2>/dev/null || echo "tdlib/source/openssl/ does not exist"
-            echo "--- git submodule status (recursive) ---"
-            git submodule status --recursive
-            echo "--- tdlib/.gitmodules (if any) ---"
-            cat tdlib/.gitmodules 2>/dev/null || echo "tdlib/.gitmodules not found"
+            echo "submodule_ok=false" >> "$GITHUB_OUTPUT"
+            # We'll try manual fallback in the next step
+          fi
+
+      # ------------------------------------------------------------
+      # MANUAL FALLBACK – clone OpenSSL if submodule failed
+      # ------------------------------------------------------------
+      - name: Manual OpenSSL clone (fallback)
+        if: steps.submodule_init.outputs.submodule_ok == 'false'
+        run: |
+          echo "Attempting manual clone of OpenSSL into tdlib/source/openssl"
+
+          # Ensure tdlib directory exists
+          if [ ! -d "tdlib" ]; then
+            echo "tdlib directory missing – cannot proceed with manual clone"
             exit 1
           fi
 
+          # Try to get the correct OpenSSL commit from tdlib/.gitmodules
+          OPENSSL_COMMIT=""
+          if [ -f "tdlib/.gitmodules" ]; then
+            echo "tdlib/.gitmodules found. Parsing for openssl submodule..."
+            # Extract the commit hash from the submodule status (if available)
+            (cd tdlib && git submodule status) | while read line; do
+              if [[ "$line" == *"source/openssl"* ]]; then
+                commit=$(echo "$line" | awk '{print $1}' | sed 's/^[+-]//')
+                OPENSSL_COMMIT="$commit"
+                echo "Found OpenSSL commit: $OPENSSL_COMMIT"
+                break
+              fi
+            done
+          fi
+
+          # If no commit found, use a known stable tag
+          if [ -z "$OPENSSL_COMMIT" ]; then
+            echo "Could not determine OpenSSL commit, falling back to OpenSSL 3.0.15"
+            OPENSSL_COMMIT="openssl-3.0.15"
+          fi
+
+          # Remove any existing directory and clone fresh
+          rm -rf tdlib/source/openssl
+          mkdir -p tdlib/source
+
+          echo "Cloning OpenSSL (commit $OPENSSL_COMMIT) into tdlib/source/openssl"
+          git clone --depth 1 --branch "$OPENSSL_COMMIT" https://github.com/openssl/openssl.git tdlib/source/openssl || {
+            echo "Clone with branch/tag failed, trying with specific commit hash..."
+            git clone https://github.com/openssl/openssl.git tdlib/source/openssl
+            (cd tdlib/source/openssl && git checkout "$OPENSSL_COMMIT")
+          }
+
+          # Verify again
+          echo "--- Verifying openssl header after manual clone ---"
+          if [ -f "tdlib/source/openssl/include/openssl/opensslv.h" ]; then
+            echo "SUCCESS: opensslv.h now found"
+          else
+            echo "ERROR: Manual clone still did not produce the header"
+            echo "Contents of tdlib/source/openssl:"
+            ls -la tdlib/source/openssl/
+            exit 1
+          fi
+
+      # ------------------------------------------------------------
+      # CONTINUE WITH THE REST OF THE BUILD
+      # ------------------------------------------------------------
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
