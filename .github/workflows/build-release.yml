@@ -42,7 +42,8 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Cache
+      # --- FIXED submodule cache with version bump to avoid broken shallow clones ---
+      - name: Cache submodules
         uses: actions/cache@v5.1.0
         with:
           path: |
@@ -51,23 +52,28 @@ jobs:
             app/jni/third_party
             thirdparty/androidx-media
             vkryl
-          key: submodules-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
+          key: submodules-v2-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
           restore-keys: |
-            submodules-${{ runner.os }}-
+            submodules-v2-${{ runner.os }}-
 
+      # --- FIXED submodule initialisation: no --depth=1, ensures nested submodules are fully fetched ---
       - name: Force-init all submodules (incl. nested)
         run: |
           git submodule sync --recursive
-          git submodule update --init --recursive --force --depth=1
+          # Convert any shallow submodules to full clones (prevents nested submodule failures)
+          git submodule foreach --recursive 'git fetch --unshallow || true'
+          # Initialize recursively without depth limit
+          git submodule update --init --recursive --force
           echo "--- Verifying openssl header ---"
           if [ -f "tdlib/source/openssl/include/openssl/opensslv.h" ]; then
             echo "SUCCESS: opensslv.h found"
           else
-            echo "STILL MISSING: opensslv.h"
+            echo "ERROR: opensslv.h still missing"
             echo "--- tdlib/source/openssl contents ---"
             ls -la tdlib/source/openssl/ 2>/dev/null || echo "tdlib/source/openssl/ does not exist"
             echo "--- git submodule status ---"
             git submodule status --recursive
+            exit 1
           fi
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
