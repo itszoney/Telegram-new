@@ -32,6 +32,8 @@ jobs:
     name: Build Release APK
     runs-on: ubuntu-22.04
     timeout-minutes: 120
+    env:
+      SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
 
     steps:
       - name: Checkout repository
@@ -80,12 +82,11 @@ jobs:
           restore-keys: native-${{ runner.os }}-
 
       - name: Decode signing keystore
-        if: ${{ secrets.SIGNING_KEYSTORE_BASE64 != '' }}
+        if: ${{ env.SIGNING_KEYSTORE_BASE64 != '' }}
         env:
-          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
-          SIGNING_STORE_PASSWORD:  ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_KEY_ALIAS:       ${{ secrets.SIGNING_KEY_ALIAS }}
-          SIGNING_KEY_PASSWORD:    ${{ secrets.SIGNING_KEY_PASSWORD }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS:      ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD:   ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
           echo "$SIGNING_KEYSTORE_BASE64" | base64 --decode > keystore.jks
 
