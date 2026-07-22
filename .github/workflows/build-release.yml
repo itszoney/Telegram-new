@@ -111,29 +111,21 @@ jobs:
             # Fallback to ls-tree if submodule status fails
             TDLIB_COMMIT=$(git ls-tree HEAD tdlib | awk '{print $3}')
           fi
-
-          TDLIB_BRANCH=$(git config --file .gitmodules submodule.tdlib.branch)
-          TDLIB_BRANCH=${TDLIB_BRANCH:-main}
-
           if [ -z "$TDLIB_COMMIT" ]; then
-            echo "WARNING: No pinned tdlib commit found in this repo (no gitlink recorded)."
-            echo "Falling back to latest '$TDLIB_BRANCH' branch instead of a pinned commit."
+            echo "ERROR: Could not get commit hash for tdlib from git submodule status or git ls-tree"
+            exit 1
           fi
-          echo "TDLIB_URL=$TDLIB_URL, TDLIB_COMMIT=${TDLIB_COMMIT:-<none, using branch $TDLIB_BRANCH>}"
+          echo "TDLIB_URL=$TDLIB_URL, TDLIB_COMMIT=$TDLIB_COMMIT"
 
           # -----------------------------------------------------------------
           # 2. Clone tdlib manually if missing
           # -----------------------------------------------------------------
           if [ ! -d "tdlib" ]; then
             echo "tdlib directory missing – cloning manually"
-            # If we have a pinned commit, do a full clone + checkout of that commit.
-            # Otherwise (no gitlink recorded in this repo), shallow-clone the branch.
-            if [ -n "$TDLIB_COMMIT" ]; then
-              git clone "$TDLIB_URL" tdlib
-              (cd tdlib && git checkout "$TDLIB_COMMIT")
-            else
-              git clone --depth 1 --branch "$TDLIB_BRANCH" "$TDLIB_URL" tdlib
-            fi
+            # Try shallow clone with the commit (if it's a branch/tag, use --branch)
+            # For a commit SHA, we can't use --branch, so do full clone and checkout
+            git clone "$TDLIB_URL" tdlib
+            (cd tdlib && git checkout "$TDLIB_COMMIT")
             if [ ! -d "tdlib/.git" ]; then
               echo "ERROR: tdlib clone failed or .git missing"
               exit 1
