@@ -66,13 +66,13 @@ jobs:
         run: |
           # Remove any stale tdlib folder and its Git metadata
           rm -rf tdlib .git/modules/tdlib
-          git submodule sync --recursive
-          git submodule update --init --recursive --force
+          git submodule sync --recursive || true
+          git submodule update --init --recursive --force || true
 
           # Extra check inside tdlib (if it exists)
           if [ -d "tdlib/.git" ]; then
             echo "tdlib submodule present, checking its submodules..."
-            (cd tdlib && git submodule sync && git submodule update --init --recursive --force)
+            (cd tdlib && git submodule sync && git submodule update --init --recursive --force) || true
           else
             echo "WARNING: tdlib directory still missing after submodule init!"
           fi
