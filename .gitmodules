@@ -1,372 +1,131 @@
-name: Build & Release
-
-on:
-  push:
-    branches: [ main, master ]
-    tags:     [ 'v*' ]
-  pull_request:
-    branches: [ main, master ]
-  workflow_dispatch:
-    inputs:
-      create_release:
-        description: 'Create a GitHub Release?'
-        required: false
-        default: 'false'
-        type: choice
-        options: ['true', 'false']
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  JAVA_VERSION: '17'
-  GRADLE_OPTS: >-
-    -Dorg.gradle.jvmargs=-Xmx4g
-    -Dorg.gradle.caching=true
-    -Dorg.gradle.daemon=false
-    -Dkotlin.incremental=false
-
-jobs:
-  build:
-    name: Build Release APK
-    runs-on: ubuntu-22.04
-    timeout-minutes: 120
-    env:
-      SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
-
-      # ------------------------------------------------------------
-      # CACHE – fresh key to avoid old broken caches
-      # ------------------------------------------------------------
-      - name: Cache submodules
-        uses: actions/cache@v5.1.0
-        with:
-          path: |
-            .git/modules
-            tdlib
-            app/jni/third_party
-            thirdparty/androidx-media
-            vkryl
-          key: submodules-v7-${{ runner.os }}-${{ hashFiles('.gitmodules') }}
-          restore-keys: |
-            submodules-v7-${{ runner.os }}-
-
-      # ------------------------------------------------------------
-      # FORCE-CLEAN and INIT submodules
-      # ------------------------------------------------------------
-      - name: Force-clean and init submodules
-        id: submodule_init
-        run: |
-          # Remove any stale tdlib folder and its Git metadata
-          rm -rf tdlib .git/modules/tdlib
-          git submodule sync --recursive || true
-          git submodule update --init --recursive --force || true
-
-          # Extra check inside tdlib (if it exists)
-          if [ -d "tdlib/.git" ]; then
-            echo "tdlib submodule present, checking its submodules..."
-            (cd tdlib && git submodule sync && git submodule update --init --recursive --force) || true
-          else
-            echo "WARNING: tdlib directory still missing after submodule init!"
-          fi
-
-          # Verify OpenSSL header
-          if [ -f "tdlib/source/openssl/include/openssl/opensslv.h.in" ]; then
-            echo "SUCCESS: opensslv.h found"
-            echo "submodule_ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ERROR: opensslv.h still missing"
-            echo "submodule_ok=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # ------------------------------------------------------------
-      # GENERIC FALLBACK – clone any other submodule that's missing
-      # (webp, ffmpeg, opus, webrtc, tgcalls, vkryl/*, etc.)
-      # ------------------------------------------------------------
-      - name: Ensure all submodules are present (generic fallback)
-        run: |
-          set +e
-          mapfile -t LINES < <(git config --file .gitmodules --get-regexp '\.path$')
-          for line in "${LINES[@]}"; do
-            key=$(echo "$line" | awk '{print $1}')
-            path=$(echo "$line" | awk '{print $2}')
-            name=$(echo "$key" | sed 's/^submodule\.//; s/\.path$//')
-            url=$(git config --file .gitmodules --get "submodule.$name.url")
-            branch=$(git config --file .gitmodules --get "submodule.$name.branch")
-
-            if [ -d "$path/.git" ] || { [ -d "$path" ] && [ -n "$(ls -A "$path" 2>/dev/null)" ]; }; then
-              echo "OK: $path already present"
-              continue
-            fi
-
-            echo "MISSING: $path -> cloning $url"
-            rm -rf "$path"
-            mkdir -p "$(dirname "$path")"
-            if [ -n "$branch" ] && git clone --depth 1 --branch "$branch" "$url" "$path" 2>/dev/null; then
-              echo "  cloned '$path' @ branch '$branch'"
-            else
-              rm -rf "$path"
-              git clone --depth 1 "$url" "$path" || echo "  ERROR: could not clone $path"
-            fi
-          done
-          set -e
-
-      # ------------------------------------------------------------
-      # MANUAL FALLBACK – clone tdlib and OpenSSL if submodule failed
-      # ------------------------------------------------------------
-      - name: Manual clone of tdlib and OpenSSL (fallback)
-        if: steps.submodule_init.outputs.submodule_ok == 'false'
-        run: |
-          echo "Starting manual fallback for tdlib and OpenSSL"
-
-          # -----------------------------------------------------------------
-          # 1. Get tdlib URL and commit hash from the parent repo
-          # -----------------------------------------------------------------
-          # URL from .gitmodules
-          TDLIB_URL=$(git config --file .gitmodules submodule.tdlib.url)
-          if [ -z "$TDLIB_URL" ]; then
-            echo "ERROR: Could not find submodule.tdlib.url in .gitmodules"
-            exit 1
-          fi
-
-          # Commit hash from git submodule status (even if not checked out)
-          # This outputs lines like: " 1234567890abcdef tdlib (heads/master)"
-          TDLIB_COMMIT=$(git submodule status | grep ' tdlib ' | awk '{print $1}' | sed 's/^[+-]//')
-          if [ -z "$TDLIB_COMMIT" ]; then
-            # Fallback to ls-tree if submodule status fails
-            TDLIB_COMMIT=$(git ls-tree HEAD tdlib | awk '{print $3}')
-          fi
-
-          TDLIB_BRANCH=$(git config --file .gitmodules submodule.tdlib.branch)
-          TDLIB_BRANCH=${TDLIB_BRANCH:-main}
-
-          if [ -z "$TDLIB_COMMIT" ]; then
-            echo "WARNING: No pinned tdlib commit found in this repo (no gitlink recorded)."
-            echo "Falling back to latest '$TDLIB_BRANCH' branch instead of a pinned commit."
-          fi
-          echo "TDLIB_URL=$TDLIB_URL, TDLIB_COMMIT=${TDLIB_COMMIT:-<none, using branch $TDLIB_BRANCH>}"
-
-          # -----------------------------------------------------------------
-          # 2. Clone tdlib manually if missing
-          # -----------------------------------------------------------------
-          if [ ! -d "tdlib" ]; then
-            echo "tdlib directory missing – cloning manually"
-            # If we have a pinned commit, do a full clone + checkout of that commit.
-            # Otherwise (no gitlink recorded in this repo), shallow-clone the branch.
-            if [ -n "$TDLIB_COMMIT" ]; then
-              git clone "$TDLIB_URL" tdlib
-              (cd tdlib && git checkout "$TDLIB_COMMIT")
-            else
-              git clone --depth 1 --branch "$TDLIB_BRANCH" "$TDLIB_URL" tdlib
-            fi
-            if [ ! -d "tdlib/.git" ]; then
-              echo "ERROR: tdlib clone failed or .git missing"
-              exit 1
-            fi
-            echo "tdlib cloned successfully"
-          else
-            echo "tdlib already exists"
-          fi
-
-          # -----------------------------------------------------------------
-          # 3. Clone OpenSSL inside tdlib/source/openssl if missing
-          # -----------------------------------------------------------------
-          if [ ! -f "tdlib/source/openssl/include/openssl/opensslv.h.in" ]; then
-            echo "OpenSSL header missing – cloning OpenSSL manually"
-
-            # Ensure the source directory exists
-            mkdir -p tdlib/source
-
-            # Try to get OpenSSL commit from tdlib/.gitmodules
-            OPENSSL_URL=""
-            OPENSSL_COMMIT=""
-            if [ -f "tdlib/.gitmodules" ]; then
-              # Get URL and commit from submodule status inside tdlib
-              OPENSSL_URL=$(cd tdlib && git config --file .gitmodules submodule.source/openssl.url)
-              OPENSSL_COMMIT=$(cd tdlib && git submodule status | grep ' source/openssl ' | awk '{print $1}' | sed 's/^[+-]//')
-              if [ -z "$OPENSSL_COMMIT" ]; then
-                OPENSSL_COMMIT=$(cd tdlib && git ls-tree HEAD source/openssl | awk '{print $3}')
-              fi
-              echo "Found OpenSSL URL: $OPENSSL_URL, commit: $OPENSSL_COMMIT"
-            fi
-
-            # If still missing, fallback to a known tag
-            if [ -z "$OPENSSL_COMMIT" ]; then
-              echo "Could not determine OpenSSL commit, falling back to openssl-3.0.15"
-              OPENSSL_COMMIT="openssl-3.0.15"
-              OPENSSL_URL="https://github.com/openssl/openssl.git"
-            fi
-
-            # Remove any existing directory and clone fresh
-            rm -rf tdlib/source/openssl
-
-            echo "Cloning OpenSSL from $OPENSSL_URL at $OPENSSL_COMMIT"
-            # Try to clone with --branch (if it's a tag/branch) else full clone + checkout
-            if git clone --depth 1 --branch "$OPENSSL_COMMIT" "$OPENSSL_URL" tdlib/source/openssl 2>/dev/null; then
-              echo "Clone with branch/tag succeeded"
-            else
-              echo "Branch clone failed, trying full clone and checkout..."
-              git clone "$OPENSSL_URL" tdlib/source/openssl
-              (cd tdlib/source/openssl && git checkout "$OPENSSL_COMMIT")
-            fi
-
-            # Verify
-            if [ ! -f "tdlib/source/openssl/include/openssl/opensslv.h.in" ]; then
-              echo "ERROR: OpenSSL clone still did not produce the header"
-              echo "Contents of tdlib/source/openssl:"
-              ls -la tdlib/source/openssl/
-              exit 1
-            fi
-            echo "OpenSSL cloned successfully"
-          else
-            echo "OpenSSL header already present"
-          fi
-
-          # Final verification
-          echo "--- Final verification ---"
-          if [ -f "tdlib/source/openssl/include/openssl/opensslv.h.in" ]; then
-            echo "SUCCESS: opensslv.h is present"
-          else
-            echo "FATAL: opensslv.h still missing after fallback"
-            exit 1
-          fi
-
-      # ------------------------------------------------------------
-      # CONTINUE WITH THE REST OF THE BUILD
-      # ------------------------------------------------------------
-      - name: Set up JDK ${{ env.JAVA_VERSION }}
-        uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: temurin
-          cache: gradle
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Read required NDK version
-        id: ndk_ver
-        run: |
-          NDK=$(grep '^version.ndk_legacy=' version.properties | cut -d= -f2 | tr -d '[:space:]')
-          echo "ndk_version=$NDK" >> "$GITHUB_OUTPUT"
-
-      - name: Install NDK ${{ steps.ndk_ver.outputs.ndk_version }}
-        run: |
-          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
-            "ndk;${{ steps.ndk_ver.outputs.ndk_version }}"
-
-      - name: Cache Gradle packages
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: gradle-${{ runner.os }}-
-
-      - name: Cache native build outputs
-        uses: actions/cache@v4
-        with:
-          path: |
-            app/jni/.cxx
-            app/build/intermediates/cmake
-          key: native-${{ runner.os }}-${{ hashFiles('app/jni/**', 'version.properties') }}
-          restore-keys: native-${{ runner.os }}-
-
-      - name: Decode signing keystore
-        if: ${{ env.SIGNING_KEYSTORE_BASE64 != '' }}
-        env:
-          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_KEY_ALIAS:      ${{ secrets.SIGNING_KEY_ALIAS }}
-          SIGNING_KEY_PASSWORD:   ${{ secrets.SIGNING_KEY_PASSWORD }}
-        run: |
-          echo "$SIGNING_KEYSTORE_BASE64" | base64 --decode > keystore.jks
-
-          cat > keystore-config.properties <<EOF
-          keystore.file=$(pwd)/keystore.jks
-          keystore.password=${SIGNING_STORE_PASSWORD}
-          key.alias=${SIGNING_KEY_ALIAS}
-          key.password=${SIGNING_KEY_PASSWORD}
-          EOF
-
-          echo "KEYSTORE_CONFIG_PATH=$(pwd)/keystore-config.properties" >> "$GITHUB_ENV"
-
-      - name: Write local.properties
-        env:
-          TELEGRAM_API_ID:   ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          APP_ID:            ${{ secrets.APP_ID }}
-          APP_NAME:          ${{ secrets.APP_NAME }}
-          APP_DOWNLOAD_URL:  ${{ secrets.APP_DOWNLOAD_URL }}
-        run: |
-          cat > local.properties <<EOF
-          sdk.dir=$ANDROID_HOME
-          telegram.api_id=${TELEGRAM_API_ID:-0}
-          telegram.api_hash=${TELEGRAM_API_HASH:-}
-          app.id=${APP_ID:-com.itszoney}
-          app.name=${APP_NAME:-Zoneygram}
-          app.download_url=${APP_DOWNLOAD_URL:-https://telegram.org/dlx}
-          EOF
-
-          if [ -n "$KEYSTORE_CONFIG_PATH" ]; then
-            echo "keystore.file=$KEYSTORE_CONFIG_PATH" >> local.properties
-          else
-            echo "app.disable_signing=true" >> local.properties
-          fi
-
-      - name: Build release APK (all ABIs)
-        run: ./gradlew assembleRelease --stacktrace
-
-      - name: Collect APKs
-        id: collect_apks
-        run: |
-          mkdir -p dist
-          find app/build/outputs/apk/*/release/ -name "*.apk" -exec cp {} dist/ \;
-          ls -lh dist/
-          echo "apk_count=$(ls dist/*.apk | wc -l)" >> "$GITHUB_OUTPUT"
-
-      - name: Upload APK artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-apks-${{ github.sha }}
-          path: dist/*.apk
-          retention-days: 30
-
-      - name: Create GitHub Release
-        if: >
-          startsWith(github.ref, 'refs/tags/v') ||
-          github.event.inputs.create_release == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name:   ${{ github.ref_name }}
-          name:       Release ${{ github.ref_name }}
-          draft:      false
-          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
-          body: |
-            ## Zoneygram – ${{ github.ref_name }}
-
-            ### What changed
-            See the [full commit history](${{ github.server_url }}/${{ github.repository }}/commits/${{ github.sha }})
-            for all changes in this release.
-
-            ### Volume improvements
-            - Separate **Volume Boost** slider (100 %–500 %) in sound settings.
-            - Boost works in 1-on-1 calls, group calls and channel calls.
-            - Signal Gain, Bass, and Treble controls preserved.
-
-            ### Downloads
-            Install the APK that matches your device ABI:
-            | ABI | File |
-            |-----|------|
-            | arm64-v8a  (most modern phones) | `*-arm64-v8a*.apk`  |
-            | armeabi-v7a (older/32-bit)      | `*-armeabi-v7a*.apk`|
-            | x86_64 (emulators)              | `*-x86_64*.apk`     |
-          files: dist/*.apk
-          token: ${{ secrets.GITHUB_TOKEN }}
+[submodule "webp"]
+	path = app/jni/third_party/webp
+	url = https://github.com/webmproject/libwebp
+	shallow = true
+	branch = 1.4.0
+[submodule "libyuv"]
+	path = app/jni/third_party/libyuv
+	url = https://chromium.googlesource.com/libyuv/libyuv
+	shallow = true
+[submodule "libtgvoip"]
+	path = app/jni/third_party/libtgvoip
+	url = https://github.com/TGX-Android/libtgvoip
+	shallow = true
+	branch = tgx
+[submodule "ffmpeg"]
+	path = app/jni/third_party/ffmpeg
+	url = https://github.com/FFmpeg/FFmpeg
+	shallow = true
+	branch = release/6.1
+[submodule "lz4"]
+	path = app/jni/third_party/lz4
+	url = https://github.com/lz4/lz4
+	shallow = true
+[submodule "androidx-media"]
+	path = thirdparty/androidx-media
+	url = https://github.com/androidx/media
+	shallow = true
+	branch = release
+[submodule "flac"]
+	path = app/jni/third_party/flac
+	url = https://github.com/xiph/flac
+	shallow = true
+[submodule "opus"]
+	path = app/jni/third_party/opus
+	url = https://github.com/xiph/opus
+	shallow = true
+[submodule "opusfile"]
+	path = app/jni/third_party/opusfile
+	url = https://github.com/xiph/opusfile
+	shallow = true
+[submodule "ogg"]
+	path = app/jni/third_party/ogg
+	url = https://github.com/xiph/ogg
+	shallow = true
+[submodule "libvpx"]
+	path = app/jni/third_party/libvpx
+	url = https://github.com/webmproject/libvpx
+	shallow = true
+[submodule "tdlib"]
+	path = tdlib
+	url = https://github.com/TGX-Android/tdlib
+	shallow = true
+	branch = main
+[submodule "jni-utils"]
+	path = app/jni/third_party/jni-utils
+	url = https://github.com/TGX-Android/jni-utils
+	shallow = true
+	branch = main
+[submodule "vkryl/leveldb"]
+	path = vkryl/leveldb
+	url = https://github.com/TGX-Android/leveldb
+	shallow = true
+	branch = main
+[submodule "vkryl/core"]
+	path = vkryl/core
+	url = https://github.com/TGX-Android/X-Core
+	shallow = true
+	branch = main
+[submodule "rlottie"]
+	path = app/jni/third_party/rlottie
+	url = https://github.com/TGX-Android/rlottie
+	shallow = true
+	branch = main
+[submodule "vkryl/td"]
+	path = vkryl/td
+	url = https://github.com/TGX-Android/tdlib-utils
+	shallow = true
+	branch = main
+[submodule "vkryl/android"]
+	path = vkryl/android
+	url = https://github.com/TGX-Android/X-Android
+	shallow = true
+	branch = main
+[submodule "usrsctp"]
+	path = app/jni/third_party/usrsctp
+	url = https://github.com/sctplab/usrsctp
+	shallow = true
+[submodule "libsrtp"]
+	path = app/jni/third_party/libsrtp
+	url = https://github.com/cisco/libsrtp
+	shallow = true
+[submodule "openh264"]
+	path = app/jni/third_party/openh264
+	url = https://github.com/cisco/openh264
+	shallow = true
+	branch = v2.4.1
+[submodule "abseil"]
+	path = app/jni/third_party/abseil-cpp
+	url = https://github.com/abseil/abseil-cpp
+	shallow = true
+[submodule "webrtc"]
+	path = app/jni/third_party/webrtc
+	url = https://github.com/TGX-Android/webrtc
+	shallow = true
+	branch = main
+[submodule "tgcalls"]
+	path = app/jni/third_party/tgcalls
+	url = https://github.com/TGX-Android/tgcalls
+	shallow = true
+	branch = main
+[submodule "libevent"]
+	path = app/jni/third_party/libevent
+	url = https://github.com/TGX-Android/libevent
+	shallow = true
+	branch = main
+[submodule "crc32c"]
+	path = app/jni/third_party/crc32c
+	url = https://github.com/google/crc32c
+	shallow = true
+	branch = main
+[submodule "rnnoise"]
+	path = app/jni/third_party/rnnoise
+	url = https://github.com/xiph/rnnoise
+	shallow = true
+	branch = master
+[submodule "rtc_base"]
+	path = app/jni/third_party/webrtc_deps/base
+	url = https://chromium.googlesource.com/chromium/src/base
+[submodule "rtc_third_party"]
+	path = app/jni/third_party/webrtc_deps/third_party
+	url = https://chromium.googlesource.com/chromium/src/third_party
