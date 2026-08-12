@@ -137,6 +137,98 @@ jobs:
           echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
             "ndk;${{ steps.ndk_ver.outputs.ndk_version }}"
 
+      - name: Setup NDK environment for OpenSSL
+        run: |
+          NDK_VERSION=${{ steps.ndk_ver.outputs.ndk_version }}
+          NDK_ROOT="${ANDROID_HOME}/ndk/${NDK_VERSION}"
+          TOOLCHAIN="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64"
+
+          # Add NDK toolchain to PATH so OpenSSL's Configure script can find aarch64-linux-android-gcc
+          echo "${TOOLCHAIN}/bin" >> $GITHUB_PATH
+
+          # Export environment variables for OpenSSL cross-compilation
+          export ANDROID_NDK_ROOT="${NDK_ROOT}"
+          export ANDROID_NDK="${NDK_ROOT}"
+          export ANDROID_SDK_ROOT="${ANDROID_HOME}"
+          export PATH="${TOOLCHAIN}/bin:${PATH}"
+
+          # Verify NDK toolchain is accessible
+          echo "NDK_ROOT: ${NDK_ROOT}"
+          echo "TOOLCHAIN: ${TOOLCHAIN}"
+          echo "Checking aarch64-linux-android-gcc..."
+          if [ -f "${TOOLCHAIN}/bin/aarch64-linux-android-gcc" ]; then
+            echo "✓ NDK toolchain found at ${TOOLCHAIN}/bin"
+            ${TOOLCHAIN}/bin/aarch64-linux-android-gcc --version | head -1
+          else
+            echo "✗ NDK toolchain NOT found – checking contents of ${TOOLCHAIN}/bin:"
+            ls -la "${TOOLCHAIN}/bin" | head -20
+            exit 1
+          fi
+
+          # Save environment variables for next steps (they inherit the modified $GITHUB_PATH)
+          echo "ANDROID_NDK_ROOT=${NDK_ROOT}" >> $GITHUB_ENV
+          echo "ANDROID_NDK=${NDK_ROOT}" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=${ANDROID_HOME}" >> $GITHUB_ENV
+
+      - name: Configure OpenSSL for Android headers
+        run: |
+          set -e
+
+          NDK_VERSION=${{ steps.ndk_ver.outputs.ndk_version }}
+          NDK_ROOT="${ANDROID_HOME}/ndk/${NDK_VERSION}"
+          TOOLCHAIN="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64"
+
+          # Set up environment for OpenSSL cross-compilation
+          export ANDROID_NDK_ROOT="${NDK_ROOT}"
+          export ANDROID_NDK="${NDK_ROOT}"
+          export ANDROID_SDK_ROOT="${ANDROID_HOME}"
+          export PATH="${TOOLCHAIN}/bin:${PATH}"
+
+          # Navigate to OpenSSL source
+          cd tdlib/source/openssl || exit 1
+
+          echo "========== OpenSSL Configuration =========="
+          echo "NDK_ROOT: ${NDK_ROOT}"
+          echo "TOOLCHAIN: ${TOOLCHAIN}"
+          echo "ANDROID_NDK_ROOT: ${ANDROID_NDK_ROOT}"
+          echo "PATH (first 3): $(echo $PATH | cut -d: -f1-3)"
+          echo "OpenSSL version: $(./Configure --version 2>&1 | head -1)"
+          echo ""
+
+          # Verify toolchain before configuring
+          if ! command -v aarch64-linux-android-gcc &> /dev/null; then
+            echo "ERROR: aarch64-linux-android-gcc not found in PATH"
+            echo "PATH is: $PATH"
+            exit 1
+          fi
+          echo "✓ aarch64-linux-android-gcc found: $(which aarch64-linux-android-gcc)"
+          echo ""
+
+          # Configure OpenSSL for Android arm64 (aarch64)
+          # Options:
+          #   android-arm64: configure for Android ARM64 (aarch64)
+          #   no-shared: build static libraries (used by TDLib)
+          #   -D__ANDROID_API__=21: target Android API 21+
+          echo "Running: ./Configure android-arm64 no-shared -D__ANDROID_API__=21 ..."
+          ./Configure android-arm64 no-shared -D__ANDROID_API__=21 || {
+            echo "Configure failed. Checking OpenSSL configure output..."
+            exit 1
+          }
+
+          # Generate dependencies (header files, include paths, etc.)
+          echo "Running: make depend ..."
+          make depend || {
+            echo "Make depend failed."
+            exit 1
+          }
+
+          echo "========== OpenSSL Configuration Complete =========="
+          echo "Generated headers:"
+          ls -lh include/openssl/opensslv.h 2>/dev/null || echo "Warning: opensslv.h not found yet (will be generated during Gradle build)"
+
+          echo "Makefile generated:"
+          ls -lh Makefile 2>/dev/null || echo "Warning: Makefile not found"
+
       - name: Cache Gradle packages
         uses: actions/cache@v4
         with:
