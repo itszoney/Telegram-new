@@ -70,14 +70,16 @@ jobs:
           git submodule sync --recursive || true
           git submodule update --init --recursive --depth 1 --force || true
 
-          # Verify that the prebuilt OpenSSL libraries shipped inside the
-          # tdlib submodule are present.  The build uses these pre-compiled
-          # .so files directly; it does NOT need the OpenSSL source tree.
-          if [ -f "tdlib/openssl/arm64-v8a/lib/libcryptox.so" ]; then
-            echo "SUCCESS: prebuilt OpenSSL libs found in tdlib/openssl/"
+          # Verify that the OpenSSL source tree shipped inside the tdlib
+          # submodule is present.  The build needs the OpenSSL source so it
+          # can be configured to generate the headers (opensslv.h, etc.)
+          # required by app/build.gradle.kts during the Gradle configuration
+          # phase.
+          if [ -d "tdlib/source/openssl" ]; then
+            echo "SUCCESS: OpenSSL source found in tdlib/source/openssl"
             echo "submodule_ok=true" >> "$GITHUB_OUTPUT"
           else
-            echo "ERROR: tdlib/openssl/ prebuilt libs missing – submodule init may have failed"
+            echo "ERROR: tdlib/source/openssl missing – submodule init may have failed"
             echo "submodule_ok=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -103,11 +105,11 @@ jobs:
           (cd tdlib && git fetch --depth 1 origin "$TDLIB_COMMIT" && git checkout "$TDLIB_COMMIT") || \
           (cd tdlib && git fetch origin && git checkout "$TDLIB_COMMIT")
 
-          # Final verification – prebuilt libs must now exist
-          if [ -f "tdlib/openssl/arm64-v8a/lib/libcryptox.so" ]; then
-            echo "SUCCESS: prebuilt OpenSSL libs found after manual clone"
+          # Final verification – OpenSSL source tree must now exist
+          if [ -d "tdlib/source/openssl" ]; then
+            echo "SUCCESS: OpenSSL source found after manual clone"
           else
-            echo "FATAL: tdlib/openssl/ still missing after manual clone"
+            echo "FATAL: tdlib/source/openssl still missing after manual clone"
             echo "Contents of tdlib/:"
             ls -la tdlib/ || true
             exit 1
@@ -195,6 +197,12 @@ jobs:
           else
             echo "app.disable_signing=true" >> local.properties
           fi
+
+      - name: Configure OpenSSL for Android headers
+        run: |
+          cd tdlib/source/openssl
+          ./Configure android-arm64 no-shared
+          make depend
 
       - name: Build release APK (all ABIs)
         run: ./gradlew assembleRelease --stacktrace
