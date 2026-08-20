@@ -30,7 +30,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config perl wget curl unzip git ca-certificates
-          sudo apt-get install -y libssl-dev zlib1g-dev libbz2-dev liblzma-dev
+          sudo apt-get install -y libssl-dev zlib1g-dev libbz2-dev liblzma-dev dos2unix
 
       - name: Detect local OpenSSL submodule
         id: detect_openssl
@@ -46,6 +46,31 @@ jobs:
             echo "found=false" >> $GITHUB_OUTPUT
             echo "path=" >> $GITHUB_OUTPUT
           fi
+
+      - name: Make build scripts executable and normalize line endings
+        run: |
+          echo "Fixing permissions and normalizing line endings for scripts"
+          # Make common script files executable
+          chmod +x scripts/*.sh || true
+          chmod +x scripts/**.sh || true
+          # Normalize CRLF to LF for shell scripts
+          if command -v dos2unix >/dev/null 2>&1; then
+            dos2unix scripts/*.sh || true
+            dos2unix scripts/**.sh || true
+          else
+            sed -i 's/\r$//' scripts/*.sh || true
+            sed -i 's/\r$//' scripts/**.sh || true
+          fi
+          ls -la scripts || true
+
+      - name: Debug script metadata
+        run: |
+          echo "Permissions and first line of scripts:"
+          for f in scripts/*.sh; do
+            echo "---- $f ----"
+            ls -l "$f" || true
+            head -n 1 "$f" | sed -n '1p' || true
+          done
 
       - name: Build OpenSSL from source (local submodule)
         if: steps.detect_openssl.outputs.found == 'true'
@@ -98,7 +123,15 @@ jobs:
           else
             echo "tput not available or TERM unset; continuing without terminal control"
           fi
-          # Run setup script if present
+          # Ensure read-property.sh is runnable; if not, run via bash to avoid permission issues
+          if [ -f "scripts/read-property.sh" ]; then
+            if [ -x "scripts/read-property.sh" ]; then
+              scripts/read-property.sh || true
+            else
+              bash scripts/read-property.sh || true
+            fi
+          fi
+          # Run setup script if present (use bash to avoid permission problems)
           if [ -f "scripts/setup.sh" ]; then
             bash scripts/setup.sh
           fi
@@ -107,7 +140,7 @@ jobs:
             ./gradlew assembleRelease --no-daemon
           else
             # Example CMake flow (uncomment and adapt if you use CMake)
-            # cmake -S . -B build -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT:-/usr}" 
+            # cmake -S . -B build -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT:-/usr}"
             # cmake --build build -- -j$(nproc)
             echo "No gradle wrapper found; run your native build commands here."
           fi
@@ -142,6 +175,12 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+
+      - name: Ensure Android scripts are executable and normalized
+        run: |
+          chmod +x scripts/*.sh || true
+          sed -i 's/\r$//' scripts/*.sh || true
+          ls -la scripts || true
 
       - name: Setup Android NDK and SDK placeholder
         run: |
