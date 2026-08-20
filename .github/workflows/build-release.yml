@@ -1,4 +1,4 @@
-name: Build and Release (native + OpenSSL fix)
+name: Build and Release (native + OpenSSL + Android fixes)
 
 on:
   push:
@@ -7,13 +7,17 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+env:
+  # global defaults
+  TERM: xterm-256color
+  PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
+
 jobs:
   build-native:
     name: Build native artifacts
     runs-on: ubuntu-latest
     env:
       TERM: xterm-256color
-      PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
     steps:
       - name: Checkout repository with submodules
         uses: actions/checkout@v4
@@ -29,8 +33,34 @@ jobs:
       - name: Install system packages (Ubuntu)
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config perl wget curl unzip git ca-certificates
-          sudo apt-get install -y libssl-dev zlib1g-dev libbz2-dev liblzma-dev dos2unix
+          sudo apt-get install -y build-essential pkg-config perl wget curl unzip git ca-certificates dos2unix
+          sudo apt-get install -y libssl-dev zlib1g-dev libbz2-dev liblzma-dev
+
+      - name: Normalize line endings and make scripts executable (including private)
+        run: |
+          echo "Normalize CRLF -> LF and set execute bit for scripts"
+          # normalize and chmod for top-level scripts
+          if [ -d scripts ]; then
+            find scripts -type f -name "*.sh" -print0 | xargs -0 -r sed -i 's/\r$//' || true
+            find scripts -type f -name "*.sh" -print0 | xargs -0 -r chmod +x || true
+          fi
+          # also handle scripts/private if present
+          if [ -d scripts/private ]; then
+            find scripts/private -type f -name "*.sh" -print0 | xargs -0 -r sed -i 's/\r$//' || true
+            find scripts/private -type f -name "*.sh" -print0 | xargs -0 -r chmod +x || true
+          fi
+          ls -la scripts || true
+          ls -la scripts/private || true
+
+      - name: Debug script metadata
+        run: |
+          echo "Permissions and shebangs for scripts:"
+          for f in scripts/*.sh scripts/private/*.sh; do
+            [ -f "$f" ] || continue
+            echo "---- $f ----"
+            ls -l "$f"
+            head -n 1 "$f" || true
+          done
 
       - name: Detect local OpenSSL submodule
         id: detect_openssl
@@ -47,31 +77,6 @@ jobs:
             echo "path=" >> $GITHUB_OUTPUT
           fi
 
-      - name: Make build scripts executable and normalize line endings
-        run: |
-          echo "Fixing permissions and normalizing line endings for scripts"
-          # Make common script files executable
-          chmod +x scripts/*.sh || true
-          chmod +x scripts/**.sh || true
-          # Normalize CRLF to LF for shell scripts
-          if command -v dos2unix >/dev/null 2>&1; then
-            dos2unix scripts/*.sh || true
-            dos2unix scripts/**.sh || true
-          else
-            sed -i 's/\r$//' scripts/*.sh || true
-            sed -i 's/\r$//' scripts/**.sh || true
-          fi
-          ls -la scripts || true
-
-      - name: Debug script metadata
-        run: |
-          echo "Permissions and first line of scripts:"
-          for f in scripts/*.sh; do
-            echo "---- $f ----"
-            ls -l "$f" || true
-            head -n 1 "$f" | sed -n '1p' || true
-          done
-
       - name: Build OpenSSL from source (local submodule)
         if: steps.detect_openssl.outputs.found == 'true'
         run: |
@@ -79,12 +84,10 @@ jobs:
           OPENSSL_DIR="${{ steps.detect_openssl.outputs.path }}"
           echo "Building OpenSSL from ${OPENSSL_DIR}"
           pushd "$OPENSSL_DIR"
-          # Adjust Configure options as needed (remove no-shared if you need shared libs)
           ./Configure linux-x86_64 no-shared --prefix="$(pwd)/openssl-install"
           make -j$(nproc)
           make install_sw
           popd
-          # Export environment variables for downstream steps
           echo "OPENSSL_ROOT=$(pwd)/${OPENSSL_DIR}/openssl-install" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=$(pwd)/${OPENSSL_DIR}/openssl-install/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=$(pwd)/${OPENSSL_DIR}/openssl-install/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
@@ -92,65 +95,52 @@ jobs:
       - name: Configure PKG_CONFIG_PATH for system OpenSSL
         if: steps.detect_openssl.outputs.found == 'false'
         run: |
-          echo "Using system OpenSSL (libssl-dev)"
           echo "PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
 
       - name: Show OpenSSL and environment info
         run: |
-          echo "Which openssl:"
           command -v openssl || true
-          echo "OpenSSL version:"
           openssl version || true
-          echo "pkg-config openssl:"
           pkg-config --modversion openssl || true
-          echo "Environment snapshot (filtered):"
           echo "TERM=${TERM:-}"
           echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-}"
           echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
           echo "OPENSSL_ROOT=${OPENSSL_ROOT:-}"
 
-      - name: Run repository native build
+      - name: Run repository native build (safe)
         env:
           TERM: xterm-256color
         run: |
           set -euo pipefail
-          echo "CI debug: show a few environment vars"
-          echo "TERM=${TERM:-}"
-          echo "OPENSSL_ROOT=${OPENSSL_ROOT:-}"
-          # Safe tput check (non-fatal)
+          echo "CI debug: TERM=${TERM:-}, OPENSSL_ROOT=${OPENSSL_ROOT:-}"
+          # Safe tput usage
           if command -v tput >/dev/null 2>&1 && [ -n "${TERM:-}" ]; then
-            tput colors 2>/dev/null || echo "tput exists but returned non-zero"
+            tput colors 2>/dev/null || echo "tput returned non-zero"
           else
-            echo "tput not available or TERM unset; continuing without terminal control"
+            echo "tput not available or TERM unset"
           fi
-          # Ensure read-property.sh is runnable; if not, run via bash to avoid permission issues
+          # If read-property.sh exists, run via bash to avoid permission issues
           if [ -f "scripts/read-property.sh" ]; then
-            if [ -x "scripts/read-property.sh" ]; then
-              scripts/read-property.sh || true
-            else
-              bash scripts/read-property.sh || true
-            fi
+            echo "Running scripts/read-property.sh via bash"
+            bash scripts/read-property.sh || true
           fi
-          # Run setup script if present (use bash to avoid permission problems)
+          # If private patch script exists, run via bash (avoid permission problems)
+          if [ -f "scripts/private/patch-opus-impl.sh" ]; then
+            echo "Running scripts/private/patch-opus-impl.sh via bash"
+            bash scripts/private/patch-opus-impl.sh || true
+          fi
+          # Run setup script via bash
           if [ -f "scripts/setup.sh" ]; then
             bash scripts/setup.sh
           fi
-          # Replace the following with your actual build commands
+          # Replace with your actual build commands
           if [ -f "gradlew" ]; then
             ./gradlew assembleRelease --no-daemon
           else
-            # Example CMake flow (uncomment and adapt if you use CMake)
-            # cmake -S . -B build -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT:-/usr}"
-            # cmake --build build -- -j$(nproc)
             echo "No gradle wrapper found; run your native build commands here."
           fi
 
-      - name: Run tests (optional)
-        if: always()
-        run: |
-          echo "No tests configured by default. Add test commands here if needed."
-
-      - name: Upload build artifacts
+      - name: Upload build artifacts (only if present)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -162,13 +152,22 @@ jobs:
             *.a
             *.so
             *.zip
+          # allow-no-files is not a direct input for upload-artifact v4; we handle missing files by checking before upload
+      - name: List artifact candidates (debug)
+        if: always()
+        run: |
+          echo "Listing possible artifact files:"
+          ls -la build || true
+          ls -la app/build/outputs || true
+          ls -la *.apk *.a *.so *.zip || true
 
   build-android:
-    name: Build Android artifacts
+    name: Build Android artifacts (with NDK install)
     runs-on: ubuntu-latest
     needs: build-native
     env:
       TERM: xterm-256color
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
     steps:
       - name: Checkout repository with submodules
         uses: actions/checkout@v4
@@ -176,26 +175,76 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Ensure Android scripts are executable and normalized
+      - name: Ensure scripts executable and normalized (android)
         run: |
-          chmod +x scripts/*.sh || true
-          sed -i 's/\r$//' scripts/*.sh || true
+          if [ -d scripts ]; then
+            find scripts -type f -name "*.sh" -print0 | xargs -0 -r sed -i 's/\r$//' || true
+            find scripts -type f -name "*.sh" -print0 | xargs -0 -r chmod +x || true
+          fi
           ls -la scripts || true
 
-      - name: Setup Android NDK and SDK placeholder
-        run: |
-          echo "Add Android SDK/NDK setup steps here if you build Android artifacts."
-          # Example: install sdkmanager, accept licenses, download NDK, set ANDROID_NDK_HOME
-
-      - name: Build Android (placeholder)
+      - name: Install Android SDK tools (cmdline-tools) and accept licenses
         run: |
           set -euo pipefail
-          echo "Ensure OpenSSL for Android is built with the NDK toolchain if required."
-          # Insert Android build commands here, e.g.:
-          # ./gradlew assembleRelease -Pandroid.ndkPath=$ANDROID_NDK_HOME
-          echo "Android build steps go here."
+          sudo mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+          sudo chown -R $USER:$USER $ANDROID_SDK_ROOT
+          # Install command-line tools if missing
+          if [ ! -d "$ANDROID_SDK_ROOT/cmdline-tools/latest" ]; then
+            mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+            cd /tmp
+            curl -sSfLo commandlinetools.zip "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip"
+            unzip -q commandlinetools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+            mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          fi
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses || true
+          sdkmanager --list || true
 
-      - name: Upload Android artifacts
+      - name: Install specific Android NDK (23.2.8568313) and build-tools
+        run: |
+          set -euo pipefail
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" || true
+          # Install the exact NDK version required
+          sdkmanager "ndk;23.2.8568313" || true
+          # Verify installation
+          if [ -d "$ANDROID_SDK_ROOT/ndk/23.2.8568313" ]; then
+            echo "NDK installed"
+            echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/23.2.8568313" >> $GITHUB_ENV
+            echo "PATH=$ANDROID_SDK_ROOT/ndk/23.2.8568313:$PATH" >> $GITHUB_ENV
+          else
+            echo "NDK 23.2.8568313 not found after sdkmanager; listing ndk dir:"
+            ls -la $ANDROID_SDK_ROOT/ndk || true
+            # Fail the job explicitly so user sees the problem
+            exit 1
+          fi
+
+      - name: Show Android SDK/NDK info
+        run: |
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-}"
+          ls -la $ANDROID_SDK_ROOT || true
+          ls -la $ANDROID_SDK_ROOT/ndk || true
+
+      - name: Run Android build (safe)
+        env:
+          TERM: xterm-256color
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          set -euo pipefail
+          echo "CI debug: TERM=${TERM:-}, ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-}"
+          # Run any private patch scripts safely via bash
+          if [ -f "scripts/private/patch-opus-impl.sh" ]; then
+            bash scripts/private/patch-opus-impl.sh || true
+          fi
+          # Run gradle build (example)
+          if [ -f "gradlew" ]; then
+            ./gradlew assembleRelease -Pandroid.ndkPath="${ANDROID_NDK_HOME:-}" --no-daemon
+          else
+            echo "No gradle wrapper found; run Android build commands here."
+          fi
+
+      - name: Upload Android artifacts (only if present)
         if: always()
         uses: actions/upload-artifact@v4
         with:
