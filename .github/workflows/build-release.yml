@@ -12,6 +12,7 @@ jobs:
     name: Build native artifacts
     runs-on: ubuntu-latest
     env:
+      TERM: xterm-256color
       PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
     steps:
       - name: Checkout repository with submodules
@@ -53,10 +54,12 @@ jobs:
           OPENSSL_DIR="${{ steps.detect_openssl.outputs.path }}"
           echo "Building OpenSSL from ${OPENSSL_DIR}"
           pushd "$OPENSSL_DIR"
+          # Adjust Configure options as needed (remove no-shared if you need shared libs)
           ./Configure linux-x86_64 no-shared --prefix="$(pwd)/openssl-install"
           make -j$(nproc)
           make install_sw
           popd
+          # Export environment variables for downstream steps
           echo "OPENSSL_ROOT=$(pwd)/${OPENSSL_DIR}/openssl-install" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=$(pwd)/${OPENSSL_DIR}/openssl-install/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=$(pwd)/${OPENSSL_DIR}/openssl-install/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
@@ -67,27 +70,52 @@ jobs:
           echo "Using system OpenSSL (libssl-dev)"
           echo "PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
 
-      - name: Show OpenSSL info
+      - name: Show OpenSSL and environment info
         run: |
-          which openssl || true
+          echo "Which openssl:"
+          command -v openssl || true
+          echo "OpenSSL version:"
           openssl version || true
+          echo "pkg-config openssl:"
           pkg-config --modversion openssl || true
-          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
-          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+          echo "Environment snapshot (filtered):"
+          echo "TERM=${TERM:-}"
+          echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-}"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
           echo "OPENSSL_ROOT=${OPENSSL_ROOT:-}"
 
       - name: Run repository native build
+        env:
+          TERM: xterm-256color
         run: |
           set -euo pipefail
-          # Replace the following with your actual build commands
+          echo "CI debug: show a few environment vars"
+          echo "TERM=${TERM:-}"
+          echo "OPENSSL_ROOT=${OPENSSL_ROOT:-}"
+          # Safe tput check (non-fatal)
+          if command -v tput >/dev/null 2>&1 && [ -n "${TERM:-}" ]; then
+            tput colors 2>/dev/null || echo "tput exists but returned non-zero"
+          else
+            echo "tput not available or TERM unset; continuing without terminal control"
+          fi
+          # Run setup script if present
           if [ -f "scripts/setup.sh" ]; then
             bash scripts/setup.sh
           fi
+          # Replace the following with your actual build commands
           if [ -f "gradlew" ]; then
             ./gradlew assembleRelease --no-daemon
           else
+            # Example CMake flow (uncomment and adapt if you use CMake)
+            # cmake -S . -B build -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT:-/usr}" 
+            # cmake --build build -- -j$(nproc)
             echo "No gradle wrapper found; run your native build commands here."
           fi
+
+      - name: Run tests (optional)
+        if: always()
+        run: |
+          echo "No tests configured by default. Add test commands here if needed."
 
       - name: Upload build artifacts
         if: always()
@@ -96,6 +124,7 @@ jobs:
           name: build-artifacts
           path: |
             build/**
+            app/build/outputs/**/*.apk
             *.apk
             *.a
             *.so
@@ -105,6 +134,8 @@ jobs:
     name: Build Android artifacts
     runs-on: ubuntu-latest
     needs: build-native
+    env:
+      TERM: xterm-256color
     steps:
       - name: Checkout repository with submodules
         uses: actions/checkout@v4
@@ -114,11 +145,16 @@ jobs:
 
       - name: Setup Android NDK and SDK placeholder
         run: |
-          echo "Add Android NDK/SDK setup steps here if you build Android artifacts."
+          echo "Add Android SDK/NDK setup steps here if you build Android artifacts."
+          # Example: install sdkmanager, accept licenses, download NDK, set ANDROID_NDK_HOME
 
       - name: Build Android (placeholder)
         run: |
-          echo "Run Android build steps here. Ensure OpenSSL for Android is built with NDK toolchain if required."
+          set -euo pipefail
+          echo "Ensure OpenSSL for Android is built with the NDK toolchain if required."
+          # Insert Android build commands here, e.g.:
+          # ./gradlew assembleRelease -Pandroid.ndkPath=$ANDROID_NDK_HOME
+          echo "Android build steps go here."
 
       - name: Upload Android artifacts
         if: always()
@@ -129,4 +165,3 @@ jobs:
             app/build/outputs/**/*.apk
             *.a
             *.so
-
