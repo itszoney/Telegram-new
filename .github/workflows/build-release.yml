@@ -12,7 +12,6 @@ jobs:
     name: Build native artifacts
     runs-on: ubuntu-latest
     env:
-      # Default values; overridden later if OpenSSL is built locally
       PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
     steps:
       - name: Checkout repository with submodules
@@ -31,15 +30,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config perl wget curl unzip git ca-certificates
           sudo apt-get install -y libssl-dev zlib1g-dev libbz2-dev liblzma-dev
-          # Add any other system deps your project needs
-          # sudo apt-get install -y libsqlite3-dev
 
       - name: Detect local OpenSSL submodule
         id: detect_openssl
         run: |
           if [ -d "third_party/openssl" ] || [ -d "openssl" ]; then
             echo "found=true" >> $GITHUB_OUTPUT
-            # prefer third_party/openssl if present
             if [ -d "third_party/openssl" ]; then
               echo "path=third_party/openssl" >> $GITHUB_OUTPUT
             else
@@ -57,8 +53,6 @@ jobs:
           OPENSSL_DIR="${{ steps.detect_openssl.outputs.path }}"
           echo "Building OpenSSL from ${OPENSSL_DIR}"
           pushd "$OPENSSL_DIR"
-          # Choose configuration target based on runner architecture
-          # Adjust Configure options as needed (shared/static, enable-ec, etc.)
           ./Configure linux-x86_64 no-shared --prefix="$(pwd)/openssl-install"
           make -j$(nproc)
           make install_sw
@@ -75,24 +69,17 @@ jobs:
 
       - name: Show OpenSSL info
         run: |
-          echo "OpenSSL binary (if available):"
           which openssl || true
           openssl version || true
-          echo "pkg-config search:"
           pkg-config --modversion openssl || true
-          echo "Environment variables:"
           echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
           echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-          echo "OPENSSL_ROOT=$OPENSSL_ROOT"
+          echo "OPENSSL_ROOT=${OPENSSL_ROOT:-}"
 
       - name: Run repository native build
         run: |
           set -euo pipefail
           # Replace the following with your actual build commands
-          # Examples:
-          # cmake -S . -B build -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT"
-          # cmake --build build -- -j$(nproc)
-          # or call your existing scripts/setup.sh and build scripts
           if [ -f "scripts/setup.sh" ]; then
             bash scripts/setup.sh
           fi
@@ -101,12 +88,6 @@ jobs:
           else
             echo "No gradle wrapper found; run your native build commands here."
           fi
-
-      - name: Run tests (optional)
-        if: always()
-        run: |
-          # Add test commands if applicable
-          echo "Skipping tests by default. Add test commands here."
 
       - name: Upload build artifacts
         if: always()
@@ -120,12 +101,10 @@ jobs:
             *.so
             *.zip
 
-  # Optional: add a separate job for Android cross-compile if needed
   build-android:
     name: Build Android artifacts
     runs-on: ubuntu-latest
     needs: build-native
-    if: contains(matrix.include, 'android') == false || always()
     steps:
       - name: Checkout repository with submodules
         uses: actions/checkout@v4
@@ -133,12 +112,21 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Setup Android NDK and SDK (example)
+      - name: Setup Android NDK and SDK placeholder
         run: |
           echo "Add Android NDK/SDK setup steps here if you build Android artifacts."
-          # Example: use actions/setup-java and download NDK, or use preinstalled toolchains
 
       - name: Build Android (placeholder)
         run: |
-          echo "Run Android build steps here. Ensure OpenSSL for Android is built with NDK toolchain."
+          echo "Run Android build steps here. Ensure OpenSSL for Android is built with NDK toolchain if required."
+
+      - name: Upload Android artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-artifacts
+          path: |
+            app/build/outputs/**/*.apk
+            *.a
+            *.so
 
